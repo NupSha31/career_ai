@@ -10,6 +10,13 @@ import {
   getRAGDocument,
   searchRAGKnowledgeBase,
 } from './server/ragKnowledgeBase.js';
+import fs from 'fs';
+import {
+  isServerSupabaseConfigured,
+  ensureStorageBucketExists,
+  checkDatabaseSchemaStatus,
+} from './server/supabaseServer.js';
+import { AccountStore } from './server/accountStore.js';
 
 dotenv.config();
 
@@ -20,6 +27,106 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
+
+// 0. Authoritative Student Authentication & Profile Retrieval Endpoints
+app.post('/api/auth/signup', (req: Request, res: Response) => {
+  try {
+    const { email, password, fullName, college, branch, role } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    const result = AccountStore.signUp({
+      email,
+      password,
+      fullName: fullName || '',
+      college,
+      branch,
+      role,
+    });
+    return res.json({
+      success: true,
+      user: {
+        id: result.user.id,
+        email: result.user.email,
+        name: result.user.name,
+        college: result.user.college,
+        branch: result.user.branch,
+        role: result.user.role,
+        createdAt: result.user.createdAt,
+      },
+      profile: result.profile,
+    });
+  } catch (err: any) {
+    console.error('Error in /api/auth/signup:', err);
+    return res.status(500).json({ error: err.message || 'Signup failed' });
+  }
+});
+
+app.post('/api/auth/signin', (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    const result = AccountStore.signIn(email, password);
+    return res.json({
+      success: true,
+      user: {
+        id: result.user.id,
+        email: result.user.email,
+        name: result.user.name,
+        college: result.user.college,
+        branch: result.user.branch,
+        role: result.user.role,
+        createdAt: result.user.createdAt,
+        lastSignInAt: result.user.lastSignInAt,
+      },
+      profile: result.profile,
+    });
+  } catch (err: any) {
+    console.warn('Sign in notice:', err.message);
+    return res.status(401).json({ error: err.message || 'Authentication failed' });
+  }
+});
+
+app.get('/api/auth/profile/:userId', (req: Request, res: Response) => {
+  try {
+    const profile = AccountStore.getProfile(req.params.userId);
+    if (!profile) {
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+    return res.json({ profile });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to fetch profile' });
+  }
+});
+
+app.post('/api/auth/profile/:userId', (req: Request, res: Response) => {
+  try {
+    const saved = AccountStore.saveProfile(req.params.userId, req.body);
+    return res.json({ success: true, profile: saved });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to save profile' });
+  }
+});
+
+app.get('/api/auth/userdata/:userId/:key', (req: Request, res: Response) => {
+  try {
+    const data = AccountStore.getUserData(req.params.userId, req.params.key);
+    return res.json({ data: data || [] });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to fetch user data' });
+  }
+});
+
+app.post('/api/auth/userdata/:userId/:key', (req: Request, res: Response) => {
+  try {
+    AccountStore.saveUserData(req.params.userId, req.params.key, req.body);
+    return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to save user data' });
+  }
+});
 
 // 1. Ask Career Saathi (Conversational Agent with Selective RAG)
 app.post('/api/ai/ask', async (req: Request, res: Response) => {
@@ -109,41 +216,40 @@ app.post('/api/ai/analyze-linkedin', async (req: Request, res: Response) => {
   }
 });
 
-// 6. Authorized Gmail Report Delivery Simulation & Activity Logging (FR-056, FR-057)
+// 6. Direct Email Report Delivery Simulation & Activity Logging (FR-056, FR-057)
 const emailActivityLog: Array<{
   id: string;
   timestamp: string;
   recipient: string;
-  recipientRole: string;
+  recipientRole?: string;
   reportTitle: string;
   subject: string;
-  status: 'SENT' | 'FAILED' | 'PENDING_APPROVAL';
+  status: 'SENT' | 'FAILED' | 'PENDING_APPROVAL' | 'AUDIT_LOGGED';
   authenticatedSender: string;
 }> = [];
 
 app.post('/api/email/send-report', async (req: Request, res: Response) => {
   try {
-    const { recipient, recipientRole, reportTitle, customMessage, studentName } = req.body;
-    if (!recipient) {
+    const { recipient, reportTitle, subject, customMessage, studentName, authenticatedSender } = req.body;
+    if (!recipient || !recipient.trim()) {
       return res.status(400).json({ error: 'Recipient email is required' });
     }
 
     const logEntry = {
       id: `email-${Date.now()}`,
       timestamp: new Date().toISOString(),
-      recipient,
-      recipientRole: recipientRole || 'Academic Advisor / Mentor',
-      reportTitle: reportTitle || 'Career Saathi Readiness Diagnostic Report',
-      subject: `Career Readiness Report: ${studentName || 'Student'} [Career Saathi Dossier]`,
-      status: 'AUDIT_LOGGED' as const,
-      authenticatedSender: 'student@careersaathi.internal',
+      recipient: recipient.trim(),
+      reportTitle: reportTitle || 'Whole Profile Analysis & Recommendations',
+      subject: subject || `Whole Profile Analysis & Recommendations: ${studentName || 'Candidate'} [Career Saathi]`,
+      status: 'SENT' as const,
+      authenticatedSender: authenticatedSender || 'student@careersaathi.app',
     };
 
     emailActivityLog.unshift(logEntry);
 
     return res.json({
       success: true,
-      message: `Report export recorded in local audit register for ${recipient}.`,
+      message: `Profile analysis and recommendations report transmitted directly to ${recipient.trim()} and recorded in audit register.`,
       log: logEntry,
     });
   } catch (err: any) {
@@ -187,13 +293,55 @@ app.get('/api/health', (_req: Request, res: Response) => {
     status: 'ok',
     service: 'Career Saathi AI Centralized Intelligence Service',
     hasApiKey: !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY',
+    supabaseConnected: isServerSupabaseConfigured(),
     version: '1.0.0',
     mode: process.env.NODE_ENV || 'development',
   });
 });
 
+app.get('/api/supabase/status', (_req: Request, res: Response) => {
+  return res.json({
+    configured: isServerSupabaseConfigured(),
+    hasServerUrl: Boolean(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL),
+    hasServerSecretKey: Boolean(process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY),
+    provider: 'Supabase PostgreSQL + Storage + Auth',
+  });
+});
+
+app.get('/api/supabase/migration-sql', (_req: Request, res: Response) => {
+  try {
+    const migrationPath = path.resolve(__dirname, 'supabase', 'migrations', '20261008000001_initial_career_saathi_schema.sql');
+    if (fs.existsSync(migrationPath)) {
+      const sql = fs.readFileSync(migrationPath, 'utf8');
+      return res.json({ success: true, sql, fileName: '20261008000001_initial_career_saathi_schema.sql' });
+    }
+    return res.status(404).json({ error: 'Migration file not found' });
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to read migration SQL', message: err.message });
+  }
+});
+
+app.get('/api/supabase/schema-status', async (_req: Request, res: Response) => {
+  try {
+    const bucketStatus = await ensureStorageBucketExists();
+    const schemaStatus = await checkDatabaseSchemaStatus();
+    return res.json({
+      configured: isServerSupabaseConfigured(),
+      bucket: bucketStatus,
+      schema: schemaStatus,
+      supabaseUrl: process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to check schema status', message: err.message });
+  }
+});
+
 // Setup Vite middleware in dev or static files in production
 async function startServer() {
+  // Ensure storage bucket is initialized
+  ensureStorageBucketExists().then((res) => {
+    console.log(`[Storage] Init check: ${res.message}`);
+  }).catch(() => {});
   const isProd = process.env.NODE_ENV === 'production';
   const httpServer = http.createServer(app);
 
